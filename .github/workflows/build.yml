@@ -1,0 +1,28 @@
+name: Build PSP
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compilar com pspsdk (container pspdev)
+        run: |
+          docker run --rm -v "$PWD":/src -w /src pspdev/pspdev:latest make
+
+      - name: Montar pasta do jogo
+        run: |
+          sudo chown -R "$USER" . || true
+          mkdir -p out/PSP/GAME/DragonBallPSP
+          cp EBOOT.PBP out/PSP/GAME/DragonBallPSP/
+          cp -r data out/PSP/GAME/DragonBallPSP/data
+          rm -f out/PSP/GAME/DragonBallPSP/data/ICON0.png
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DragonBallPSP
+          path: out
