@@ -7,7 +7,7 @@ CXXFLAGS = $(CFLAGS) -fno-exceptions -fno-rtti
 ASFLAGS = $(CFLAGS)
 
 LIBDIR =
-LIBS = -lpspgu -lpspge -lpspdisplay -lpspctrl -lm
+LIBS = -lpspgu -lpspge -lpspdisplay -lpspctrl -lpspaudio -lm
 
 EXTRA_TARGETS = EBOOT.PBP
 PSP_EBOOT_TITLE = Dragon Ball PSP

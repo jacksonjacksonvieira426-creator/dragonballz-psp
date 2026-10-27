@@ -13,3 +13,8 @@ D-Pad/analógico: mover, ↑ pular, ↓ defender · X soco (X,X,X combo) · ■ 
 
 ## Regenerar os dados (opcional)
 `python3 tools/pack_assets.py "<pasta do zip original extraída>" data` (requer Pillow).
+
+## Efeitos e áudio
+- Efeitos visuais (aura, explosões, raio do super, poeira) vêm do `Effects.png` do novo.zip → `data/fx.dat`.
+- Vozes dos personagens (`vox_N.bnk`), falas do narrador (`ann.bnk`) e efeitos sonoros sintetizados (`sfx.bnk`).
+- Para regenerar tudo: `python3 tools/pack_assets.py "<zip antigo extraído>" data "<novo.zip extraído>"`

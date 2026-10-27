@@ -11,6 +11,7 @@
 #include <pspgu.h>
 #include <psputils.h>
 #include <malloc.h>
+#include <pspaudio.h>
 PSP_MODULE_INFO("DragonBallPSP", PSP_MODULE_USER, 1, 0);
 PSP_MAIN_THREAD_ATTR(THREAD_ATTR_USER | THREAD_ATTR_VFPU);
 PSP_HEAP_SIZE_KB(-1024);
@@ -33,7 +34,7 @@ PSP_HEAP_SIZE_KB(-1024);
 #define WORLD_W 880
 #define NANIM 16
 #define NCHAR 28
-#define NSTAGE 8
+#define NSTAGE 9
 #define HP_MAX 1000
 #define KI_MAX 1000
 #define BLAST_COST 80
@@ -43,6 +44,7 @@ PSP_HEAP_SIZE_KB(-1024);
 
 #define RGBA(r, g, b, a) (((u32)(a) << 24) | ((u32)(b) << 16) | ((u32)(g) << 8) | (u32)(r))
 #define WHITE 0xFFFFFFFFu
+#include "fx_rects.h"
 
 enum { A_IDLE, A_WALK, A_JUMP, A_GUARD, A_DASH, A_ATK1, A_ATK2, A_ATK3, A_BLAST,
        A_SUPER, A_HIT, A_HIT2, A_FALL, A_LIE, A_WIN, A_AIR };
@@ -89,7 +91,7 @@ static const CharInfo CH[NCHAR] = {
 };
 static const char *STAGE_NAME[NSTAGE + 1] = {
     "GRASSLANDS", "VOLCANIC SUNSET", "WEST CITY", "DEEP SPACE", "MEADOW",
-    "TEAL CANYON", "MOONLIT PLAINS", "OCEAN SKIES", "RANDOM"};
+    "TEAL CANYON", "MOONLIT PLAINS", "OCEAN SKIES", "NAMEK", "RANDOM"};
 
 typedef struct { int dmg, reach, kb, stun, knock; } AtkP;
 static const AtkP ATKP[5] = {
@@ -129,6 +131,7 @@ static void set_wrap(int rep) {
     sceGuTexWrap(rep ? GU_REPEAT : GU_CLAMP, rep ? GU_REPEAT : GU_CLAMP);
 }
 static void blend_normal(void) { sceGuBlendFunc(GU_ADD, GU_SRC_ALPHA, GU_ONE_MINUS_SRC_ALPHA, 0, 0); }
+static void blend_add_full(void) { sceGuBlendFunc(GU_ADD, GU_FIX, GU_FIX, 0xFFFFFFFF, 0xFFFFFFFF); }
 static void blend_add(void) { sceGuBlendFunc(GU_ADD, GU_SRC_ALPHA, GU_FIX, 0, 0xFFFFFFFF); }
 
 static void draw_tex(int u, int v, int tw, int th, int x, int y, int w, int h, int flip, u32 col) {
@@ -183,8 +186,8 @@ static void build_font_metrics(void) {
         int cx = (i & 15) * 16, cy = (i >> 4) * 16, maxx = -1;
         for (y = 0; y < 16; y++)
             for (x = 0; x < 16; x++)
-                if ((g_font[(cy + y) * 256 + cx + x] >> 12) > 3 && x > maxx) maxx = x;
-        g_adv[i] = (unsigned char)(maxx < 0 ? 5 : maxx + 3);
+                if ((g_font[(cy + y) * 256 + cx + x] >> 12) > 1 && x > maxx) maxx = x;
+        g_adv[i] = (unsigned char)(maxx < 0 ? 5 : maxx + 2);
     }
 }
 static int text_w(const char *s, float sc) {
@@ -321,22 +324,145 @@ static void draw_stage(float cam) {
 /* ------------------------------------------------------------------ */
 /* Lutadores                                                           */
 /* ------------------------------------------------------------------ */
+
+/* ------------------------------------------------------------------ */
+/* Efeitos visuais (atlas fx.dat) e audio                              */
+/* ------------------------------------------------------------------ */
+static unsigned short *g_fx;
+static void fx_quad(int idx, int x, int y, int w, int h, int flip, u32 col) {
+    const short *r = FXR[idx];
+    bind_tex(g_fx, GU_PSM_5551, 512, 512); set_filter(1); set_wrap(0);
+    blend_add_full();
+    draw_tex(r[0], r[1], r[2], r[3], x, y, w, h, flip, col);
+    blend_normal();
+}
+static void fx_draw(int idx, float cx, float cy, float sc, u32 col) {
+    const short *r = FXR[idx];
+    int w = (int)(r[2] * sc), h = (int)(r[3] * sc);
+    fx_quad(idx, (int)(cx - w / 2), (int)(cy - h / 2), w, h, 0, col);
+}
+
+typedef struct { const short *d; int n; } Snd;
+typedef struct { Snd s[16]; int cnt; short *buf; } Bank;
+static Bank g_sfx, g_ann, g_vox[2];
+enum { SFX_HIT_L, SFX_HIT_H, SFX_GUARD, SFX_BLAST, SFX_BEAM, SFX_EXPL, SFX_LAND, SFX_DASH,
+       SFX_CHARGE, SFX_MOVE, SFX_OK };
+enum { VX_HIT = 0, VX_HURT = 4, VX_DEFEAT = 8, VX_CHARGE = 9, VX_FIRE = 10, VX_AIM = 11 };
+enum { AN_FIGHT, AN_KO, AN_WIN0, AN_WIN1, AN_WIN2 };
+static const unsigned char VOXSET[NCHAR] = {
+    0, 0, 0, 0, 1, 1, 2, 2, 3, 4, 5, 6, 7, 8, 9, 10, 1, 1, 0, 11, 7, 0, 1, 1, 0, 7, 10, 13};
+#define NACH 10
+typedef struct { volatile int on; const short *d; int n; unsigned pos; int vol; } AChan;
+static AChan g_ach[NACH];
+
+static int load_bank(const char *name, Bank *b) {
+    char path[300];
+    FILE *f;
+    unsigned cnt, lens[16];
+    unsigned i;
+    size_t total = 0, off = 0;
+    memset(b, 0, sizeof *b);
+    snprintf(path, sizeof path, "%sdata/%s", g_base, name);
+    f = fopen(path, "rb");
+    if (!f) return 0;
+    if (fread(&cnt, 4, 1, f) != 1 || cnt > 16 || fread(lens, 4, cnt, f) != cnt) { fclose(f); return 0; }
+    for (i = 0; i < cnt; i++) total += lens[i];
+    b->buf = (short *)malloc(total * 2 + 4);
+    if (!b->buf || fread(b->buf, 2, total, f) != total) { fclose(f); free(b->buf); b->buf = 0; return 0; }
+    fclose(f);
+    for (i = 0; i < cnt; i++) { b->s[i].d = b->buf + off; b->s[i].n = (int)lens[i]; off += lens[i]; }
+    b->cnt = (int)cnt;
+    return 1;
+}
+static void snd_play(const Snd *s, int vol) {
+    int i, pick = -1;
+    unsigned best = 0;
+    if (!s || s->n <= 0) return;
+    for (i = 0; i < NACH; i++) if (!g_ach[i].on) { pick = i; break; }
+    if (pick < 0) {
+        pick = 0;
+        for (i = 0; i < NACH; i++) if (g_ach[i].pos >= best) { best = g_ach[i].pos; pick = i; }
+    }
+    g_ach[pick].on = 0;
+    g_ach[pick].d = s->d; g_ach[pick].n = s->n; g_ach[pick].pos = 0; g_ach[pick].vol = vol;
+    g_ach[pick].on = 1;
+}
+static void sfx(int id) { if (id >= 0 && id < g_sfx.cnt) snd_play(&g_sfx.s[id], 210); }
+static void ann(int id, int vol) { if (id >= 0 && id < g_ann.cnt) snd_play(&g_ann.s[id], vol); }
+static void vox_slot(int fi, int slot) {
+    if (fi >= 0 && fi < 2 && slot >= 0 && slot < g_vox[fi].cnt) snd_play(&g_vox[fi].s[slot], 255);
+}
+static void vox_rand(int fi, int base) {
+    int k, n = 0, list[4];
+    if (fi < 0 || fi > 1) return;
+    for (k = 0; k < 4; k++)
+        if (g_vox[fi].cnt > base + k && g_vox[fi].s[base + k].n > 0) list[n++] = base + k;
+    if (n) vox_slot(fi, list[rand() % n]);
+}
+static void audio_stop_all(void) { int i; for (i = 0; i < NACH; i++) g_ach[i].on = 0; }
+
+#ifndef HOST_TEST
+static volatile int g_audio_run = 0;
+static int audio_thread(SceSize args, void *argp) {
+    static short out[1024] __attribute__((aligned(64)));
+    int mix[1024];
+    int ch = sceAudioChReserve(PSP_AUDIO_NEXT_CHANNEL, 1024, PSP_AUDIO_FORMAT_MONO);
+    if (ch < 0) return 0;
+    while (g_audio_run) {
+        int i, c;
+        memset(mix, 0, sizeof mix);
+        for (c = 0; c < NACH; c++) {
+            AChan *a = &g_ach[c];
+            unsigned pos;
+            if (!a->on) continue;
+            pos = a->pos;
+            for (i = 0; i < 1024; i++) {
+                unsigned idx = pos >> 16;
+                int fr = (int)(pos & 0xFFFF), s0, s1;
+                if ((int)idx >= a->n) { a->on = 0; break; }
+                s0 = a->d[idx];
+                s1 = ((int)idx + 1 < a->n) ? a->d[idx + 1] : s0;
+                mix[i] += ((s0 + (((s1 - s0) * (fr >> 4)) >> 12)) * a->vol) >> 8;
+                pos += 0x8000;
+            }
+            a->pos = pos;
+        }
+        for (i = 0; i < 1024; i++) {
+            int v = mix[i];
+            if (v > 32767) v = 32767;
+            if (v < -32768) v = -32768;
+            out[i] = (short)v;
+        }
+        sceAudioOutputPannedBlocking(ch, PSP_AUDIO_VOLUME_MAX, PSP_AUDIO_VOLUME_MAX, out);
+    }
+    sceAudioChRelease(ch);
+    return 0;
+}
+static void audio_start(void) {
+    int th;
+    g_audio_run = 1;
+    th = sceKernelCreateThread("audio", audio_thread, 0x12, 0x4000, THREAD_ATTR_USER, NULL);
+    if (th >= 0) sceKernelStartThread(th, 0, NULL);
+}
+#endif
+
 typedef struct {
     int ch;
     Sprites *spr;
     float x, h, vx, vh;
     int face, st, anim, af, at, done;
     int hp, ki, stun, atkk, hit_done, next, jt, dash_t, cool, invul, lie, bounced;
-    int hitalt, fired, charging, hflash, combo, combo_t, wins, ko, guardflash;
+    int hitalt, fired, charging, hflash, combo, combo_t, wins, ko, guardflash, chg_prev;
     float hp_disp;
     int is_cpu, ai_t, ai_mode, ai_cd;
 } Fighter;
 
-typedef struct { int on; float x, hgt, vx; int owner, dmg, kind, life; float r; u32 col; } Proj;
-typedef struct { int on; float x, y, size; int t, life; u32 col; } Spark;
+typedef struct { int on; float ox, x, hgt, vx; int owner, dmg, kind, life; float r; u32 col; } Proj;
+typedef struct { int on; float x, y, size; int t, life; u32 col; int seq; } Spark;
 
 static Sprites g_spr[2];
 static Fighter F[2];
+static int fidx(Fighter *f) { return (int)(f - F); }
 static Proj g_proj[12];
 static Spark g_spark[24];
 static float g_cam = 0;
@@ -363,7 +489,17 @@ static void add_spark(float x, float y, float size, u32 col, int life) {
     for (i = 0; i < 24; i++)
         if (!g_spark[i].on) {
             g_spark[i].on = 1; g_spark[i].x = x; g_spark[i].y = y; g_spark[i].size = size;
-            g_spark[i].t = 0; g_spark[i].life = life; g_spark[i].col = col;
+            g_spark[i].t = 0; g_spark[i].life = life; g_spark[i].col = col; g_spark[i].seq = -1;
+            return;
+        }
+}
+
+static void add_fx(float x, float y, float size, u32 col, int life, int seq) {
+    int i;
+    for (i = 0; i < 24; i++)
+        if (!g_spark[i].on) {
+            g_spark[i].on = 1; g_spark[i].x = x; g_spark[i].y = y; g_spark[i].size = size;
+            g_spark[i].t = 0; g_spark[i].life = life; g_spark[i].col = col; g_spark[i].seq = seq;
             return;
         }
 }
@@ -379,6 +515,8 @@ static int apply_hit(Fighter *t, Fighter *a, int dmg, int kb, int stun, int knoc
         t->vx = dir * 2.5f; t->guardflash = 8;
         t->ki += 15; if (t->ki > KI_MAX) t->ki = KI_MAX;
         add_spark(t->x - g_cam + t->face * 14, sy, 22, RGBA(120, 200, 255, 255), 8);
+        add_fx(t->x - g_cam + t->face * 14, sy, 40.f, RGBA(120, 200, 255, 255), 8, 3);
+        sfx(SFX_GUARD);
         g_hitstop = 2;
         return 2;
     }
@@ -390,6 +528,9 @@ static int apply_hit(Fighter *t, Fighter *a, int dmg, int kb, int stun, int knoc
     t->face = -dir;
     if (t->hp <= 0) { t->hp = 0; t->ko = 1; knock = 1; }
     add_spark(t->x - g_cam, sy, knock ? 46.f : 30.f, RGBA(255, 240, 160, 255), 10);
+    if (knock) add_fx(t->x - g_cam, sy, 80.f, WHITE, 16, 1); else add_fx(t->x - g_cam, sy, 44.f, WHITE, 10, 0);
+    sfx(knock ? SFX_HIT_H : SFX_HIT_L);
+    if (rand() % 100 < 60) vox_rand(fidx(t), VX_HURT);
     g_hitstop = knock ? 6 : 3;
     if (knock) g_shake = 8;
     if (knock || t->h > 0.5f || t->ko) {
@@ -412,6 +553,9 @@ static void fire_proj(Fighter *f, int idx, int kind) {
             p->vx = f->face * (kind ? 11.0f : 7.5f);
             p->owner = idx; p->dmg = (int)((kind ? 260 : 55) * CH[f->ch].power);
             p->kind = kind; p->life = 140; p->r = kind ? 30.f : 13.f; p->col = CH[f->ch].color;
+            p->ox = p->x;
+            if (kind) { sfx(SFX_BEAM); vox_slot(idx, VX_FIRE); }
+            else { sfx(SFX_BLAST); if (rand() % 100 < 50) vox_rand(idx, VX_HIT); }
             return;
         }
 }
@@ -420,6 +564,7 @@ static void start_attack(Fighter *f, int kind) {
     f->st = S_ATK; f->atkk = kind; f->hit_done = 0; f->next = 0;
     force_anim(f, kind == 1 ? A_ATK1 : kind == 2 ? A_ATK2 : kind == 3 ? A_ATK3 : A_AIR);
     if (kind != 4) f->vx = 0;
+    if (rand() % 100 < 55) vox_rand(fidx(f), VX_HIT);
 }
 
 static void fighter_update(Fighter *f, Fighter *e, int idx, unsigned held, unsigned press, int can_act) {
@@ -439,7 +584,8 @@ static void fighter_update(Fighter *f, Fighter *e, int idx, unsigned held, unsig
         f->vx = 0;
         if (f->ko) { f->st = S_IDLE; break; }
         if (f->cool == 0 && (press & IN_S) && f->ki >= SUPER_COST) {
-            f->ki -= SUPER_COST; f->st = S_SUPER; force_anim(f, A_SUPER); f->fired = 0; break;
+            f->ki -= SUPER_COST; f->st = S_SUPER; force_anim(f, A_SUPER); f->fired = 0;
+            vox_slot(idx, VX_AIM); sfx(SFX_CHARGE); break;
         }
         if (f->cool == 0 && (press & IN_B) && f->ki >= BLAST_COST) {
             f->ki -= BLAST_COST; f->st = S_BLAST; force_anim(f, A_BLAST); f->fired = 0; break;
@@ -453,7 +599,7 @@ static void fighter_update(Fighter *f, Fighter *e, int idx, unsigned held, unsig
         }
         if (press & IN_DASH) {
             int d = dir ? dir : f->face;
-            f->st = S_DASH; f->dash_t = 12; f->vx = d * 8.0f; f->invul = 6;
+            f->st = S_DASH; f->dash_t = 12; f->vx = d * 8.0f; f->invul = 6; sfx(SFX_DASH);
             if (d != f->face) f->vx = d * 6.5f;
             force_anim(f, A_DASH); break;
         }
@@ -559,7 +705,10 @@ static void fighter_update(Fighter *f, Fighter *e, int idx, unsigned held, unsig
             f->h = 0;
             if (f->st == S_FALL) {
                 if (!f->bounced && fabsf(f->vh) > 5.0f) { f->bounced = 1; f->vh = -f->vh * 0.35f; f->vx *= 0.5f; g_shake = 5; }
-                else { f->vh = 0; f->vx = 0; f->st = S_LIE; f->lie = 45; g_shake = 6; }
+                else {
+                    f->vh = 0; f->vx = 0; f->st = S_LIE; f->lie = 45; g_shake = 6;
+                    add_fx(f->x - g_cam, GROUND_Y - 4, 80.f, WHITE, 16, 2); sfx(SFX_LAND);
+                }
             } else {
                 f->vh = 0; f->vx = 0;
                 if (f->st == S_JUMP || f->st == S_ATK) { f->st = S_IDLE; f->cool = 3; }
@@ -571,6 +720,8 @@ static void fighter_update(Fighter *f, Fighter *e, int idx, unsigned held, unsig
     if (f->x < 28) f->x = 28;
     if (f->x > WORLD_W - 28) f->x = WORLD_W - 28;
     if (f->ki > KI_MAX) f->ki = KI_MAX;
+    if (f->charging && !f->chg_prev && f->st != S_SUPER) { sfx(SFX_CHARGE); vox_slot(idx, VX_CHARGE); }
+    f->chg_prev = f->charging;
     if (f->hp_disp > f->hp) f->hp_disp -= 3.0f; else f->hp_disp = (float)f->hp;
     if (f->hp_disp < f->hp) f->hp_disp = (float)f->hp;
 }
@@ -665,11 +816,20 @@ static int start_match(int p1, int p2, int stage) {
         F[i].ch = i ? p2 : p1; F[i].spr = &g_spr[i]; F[i].is_cpu = i;
     }
     g_round = 1; g_stage_id = stage;
+    {
+        char nm[32];
+        for (i = 0; i < 2; i++) {
+            snprintf(nm, sizeof nm, "vox_%d.bnk", VOXSET[F[i].ch]);
+            load_bank(nm, &g_vox[i]);
+        }
+    }
     start_round();
     g_scene = SC_FIGHT; g_paused = 0;
     return 1;
 }
 static void end_match(void) {
+    audio_stop_all();
+    free(g_vox[0].buf); free(g_vox[1].buf); memset(g_vox, 0, sizeof g_vox);
     free_sprites(&g_spr[0]); free_sprites(&g_spr[1]);
 }
 
@@ -737,6 +897,11 @@ static void check_round_end(void) {
         else if (F[1].hp > F[0].hp) w = 1;
         if (w >= 0) F[w].wins++;
         g_phase = P_KO; g_phase_t = 0;
+        if (F[0].hp <= 0 || F[1].hp <= 0) {
+            int ls = (w == 0) ? 1 : (w == 1) ? 0 : -1;
+            if (ls >= 0) vox_slot(ls, VX_DEFEAT);
+            ann(AN_KO, 255); sfx(SFX_EXPL);
+        }
         for (i = 0; i < 2; i++) {
             if (i == w && F[i].st != S_FALL && F[i].st != S_LIE) { F[i].st = S_WIN; force_anim(&F[i], A_WIN); }
         }
@@ -753,6 +918,7 @@ static void fight_update(unsigned held0, unsigned press0) {
     if (g_shake > 0) g_shake--;
     if (g_flash > 0) g_flash--;
     g_phase_t++;
+    if (g_phase == P_INTRO && g_phase_t == 50) ann(AN_FIGHT, 255);
     if (g_phase == P_INTRO && g_phase_t >= 100) { g_phase = P_FIGHT; g_phase_t = 0; }
     if (g_phase == P_FIGHT && g_timer > 0) g_timer--;
     if (can) ai_think(&F[1], &F[0], &h1, &p1); else { h1 = 0; p1 = 0; }
@@ -765,7 +931,7 @@ static void fight_update(unsigned held0, unsigned press0) {
     if (g_phase == P_KO && g_phase_t >= 200) {
         int i;
         if (F[0].wins >= 2 || F[1].wins >= 2) {
-            g_result_win = (F[0].wins >= 2); g_scene = SC_RESULT;
+            g_result_win = (F[0].wins >= 2); g_scene = SC_RESULT; ann(AN_WIN0 + rand() % 3, 255);
         } else {
             if (g_pending >= 0 || 1) g_round++;
             start_round();
@@ -798,10 +964,9 @@ static void draw_shadow(Fighter *f, float camx) {
 }
 
 static void draw_aura(Fighter *f, float camx, int t) {
-    float pulse = 1.0f + 0.12f * sinf(t * 0.5f);
-    float sx = f->x - camx, sy = GROUND_Y - f->h - 55;
-    u32 c = CH[f->ch].color; c = (c & 0x00FFFFFFu) | (150u << 24);
-    glow(sx, sy, 62 * pulse, 84 * pulse, c, 1);
+    float sx = f->x - camx, sy = GROUND_Y - f->h - 62;
+    u32 c = CH[f->ch].color | 0xFF000000u;
+    fx_draw(((t >> 2) & 1) ? FXI_FLAME1 : FXI_FLAME0, sx, sy, 1.15f, c);
 }
 
 static void draw_projectiles(float camx) {
@@ -812,9 +977,12 @@ static void draw_projectiles(float camx) {
         if (!p->on) continue;
         sx = p->x - camx; sy = GROUND_Y - p->hgt;
         if (p->kind) {
-            glow(sx - p->vx * 3.0f, sy, p->r * 4.2f, p->r * 1.5f, (p->col & 0x00FFFFFFu) | (200u << 24), 1);
-            glow(sx, sy, p->r * 1.9f, p->r * 1.9f, p->col, 1);
-            glow(sx, sy, p->r * 1.0f, p->r * 1.0f, WHITE, 1);
+            float x0 = p->ox - camx, len = fabsf(sx - x0);
+            int fl = p->vx < 0;
+            u32 bc = p->col | 0xFF000000u;
+            if (len > 6) fx_quad(FXI_BEAM_BODY, (int)(x0 < sx ? x0 : sx), (int)(sy - 22), (int)len, 44, 0, bc);
+            fx_draw(FXI_BEAM_HEAD, x0, sy, 1.1f, bc);
+            fx_quad(FXI_BEAM_TAIL, (int)(sx - 32), (int)(sy - 32), 64, 64, fl, bc);
         } else {
             glow(sx, sy, p->r * 2.0f, p->r * 2.0f, p->col, 1);
             glow(sx, sy, p->r * 1.0f, p->r * 1.0f, WHITE, 1);
@@ -828,6 +996,15 @@ static void draw_sparks(void) {
         float k;
         u32 a;
         if (!s->on) continue;
+        if (s->seq >= 0) {
+            static const unsigned char SN[4] = {7, 5, 7, 2};
+            static const unsigned char SF[4] = {FXI_HIT_S0, FXI_EXP0, FXI_DUST0, FXI_FLASH0};
+            static const float SR[4] = {32.f, 64.f, 64.f, 32.f};
+            int fr = s->t * SN[s->seq] / s->life;
+            if (fr >= SN[s->seq]) fr = SN[s->seq] - 1;
+            fx_draw(SF[s->seq] + fr, s->x, s->y, s->size / SR[s->seq] * 1.4f, s->col | 0xFF000000u);
+            continue;
+        }
         k = (float)s->t / (float)s->life;
         a = (u32)(255 * (1.0f - k));
         glow(s->x, s->y, s->size * (0.6f + k), s->size * (0.6f + k), (s->col & 0x00FFFFFFu) | (a << 24), 1);
@@ -990,6 +1167,10 @@ static void game_update(const SceCtrlData *pad) {
     unsigned held = pad_to_mask(pad), press = held & ~g_prev_held;
     unsigned bp = pad->Buttons & ~g_prev_buttons;
     g_prev_held = held; g_prev_buttons = pad->Buttons;
+    if (g_scene == SC_TITLE || g_scene == SC_SELECT) {
+        if (bp & (PSP_CTRL_UP | PSP_CTRL_DOWN | PSP_CTRL_LEFT | PSP_CTRL_RIGHT)) sfx(SFX_MOVE);
+        if (bp & PSP_CTRL_CROSS) sfx(SFX_OK);
+    }
 
     switch (g_scene) {
     case SC_TITLE:
@@ -1091,6 +1272,14 @@ static int game_init(void) {
         }
     }
     sceKernelDcacheWritebackAll();
+    g_fx = (unsigned short *)memalign(64, 512 * 512 * 2);
+    if (!g_fx || !load_file("fx.dat", g_fx, 512 * 512 * 2)) return 0;
+    sceKernelDcacheWritebackAll();
+    load_bank("sfx.bnk", &g_sfx);
+    load_bank("ann.bnk", &g_ann);
+#ifndef HOST_TEST
+    audio_start();
+#endif
     if (!load_stage(0)) return 0;
     return 1;
 }
